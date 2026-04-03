@@ -54,6 +54,7 @@ def authenticate():
     # --- Playwright login (two instances) ---
     try:
         src_cookie = ht_auth.get_auth_cookie_playwright(src_instance, email, password)
+        print(f"[DEBUG] SRC cookie names: {[p.split('=')[0] for p in src_cookie.split('; ')]}")
     except Exception as exc:
         return render_template(
             "index.html", step="login",
@@ -62,6 +63,7 @@ def authenticate():
 
     try:
         dst_cookie = ht_auth.get_auth_cookie_playwright(dst_instance, email, password)
+        print(f"[DEBUG] DST cookie names: {[p.split('=')[0] for p in dst_cookie.split('; ')]}")
     except Exception as exc:
         return render_template(
             "index.html", step="login",

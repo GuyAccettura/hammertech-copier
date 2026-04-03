@@ -8,6 +8,7 @@ for accessing the IssueTypes / ObservationTypes endpoint.
 
 import time
 import requests
+from urllib.parse import quote
 
 AUTH_BASE = "https://us-auth.hammertechonline.com"
 DEV_API_BASE = "https://us-api.hammertechonline.com"
@@ -17,11 +18,20 @@ def get_auth_cookie_playwright(instance: str, email: str, password: str) -> str:
     """
     Launch a headless Chromium browser, log into HammerTech for *instance*,
     and return the HAMMERTECHAUTH1 session cookie as a 'name=value' string.
+
+    Skips the VerifyEmail step by jumping directly to the LoginUser page
+    with the email pre-supplied in the query string.
     """
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
     cookie_name_upper = f"HAMMERTECHAUTH1{instance.upper()}.HAMMERTECHONLINE.COM"
-    login_url = f"{AUTH_BASE}/Login/LoginUser?tenant={instance}&returnUrl="
+    # Jump straight to the password page — avoids the disabled/readonly email field
+    login_url = (
+        f"{AUTH_BASE}/Login/LoginUser"
+        f"?Email={quote(email)}&Tenant={instance}"
+        f"&IsChangePassword=False&ResetName=False"
+        f"&IsChangepasswordFirstTime=False&Source=LoginClick"
+    )
     instance_host = f"{instance}.hammertechonline.com"
 
     with sync_playwright() as p:
@@ -32,20 +42,15 @@ def get_auth_cookie_playwright(instance: str, email: str, password: str) -> str:
         context = browser.new_context()
         page = context.new_page()
         try:
-            page.goto(login_url, wait_until="domcontentloaded", timeout=20_000)
+            page.goto(login_url, wait_until="networkidle", timeout=30_000)
 
-            # Step 1: email
-            page.wait_for_selector('[name="email"]', timeout=10_000)
-            page.fill('[name="email"]', email)
-            page.keyboard.press("Enter")
-
-            # Step 2: password (may appear on a separate page)
+            # Password field should be enabled on this page
             try:
-                page.wait_for_selector('[name="password"]', timeout=10_000)
+                page.wait_for_selector('[name="password"]:not([disabled])', timeout=10_000)
             except PWTimeout:
                 raise ValueError(
-                    f"Password field not found after submitting email for '{instance}'. "
-                    "The login page structure may have changed."
+                    f"Password field not found or not enabled for '{instance}'. "
+                    f"Current URL: {page.url}"
                 )
             page.fill('[name="password"]', password)
             page.keyboard.press("Enter")
@@ -59,18 +64,24 @@ def get_auth_cookie_playwright(instance: str, email: str, password: str) -> str:
                     "Check credentials and instance name."
                 )
 
-            # Step 4: poll for the auth cookie (SPA may set it asynchronously)
+            # Step 4: poll for the HAMMERTECHAUTH1 cookie — it is set during the
+            # redirect, so no additional navigation needed.
             for _ in range(20):
-                for c in context.cookies():
-                    if c["name"].upper() == cookie_name_upper:
-                        return f"{c['name']}={c['value']}"
+                all_cookies = context.cookies()
+                if any(c["name"].upper() == cookie_name_upper for c in all_cookies):
+                    break
                 time.sleep(1)
+            else:
+                raise ValueError(
+                    f"Auth cookie '{cookie_name_upper}' not found. "
+                    f"Cookies: {[c['name'] for c in context.cookies()]}"
+                )
 
-            found = [c["name"] for c in context.cookies()]
-            raise ValueError(
-                f"Auth cookie '{cookie_name_upper}' not found after login. "
-                f"Cookies present: {found}"
-            )
+            # Return only cookies scoped to the instance domain
+            instance_cookies = context.cookies(urls=[f"https://{instance_host}/"])
+            cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in instance_cookies)
+            print(f"[DEBUG] Cookie names for {instance}: {[c['name'] for c in instance_cookies]}")
+            return cookie_str
         finally:
             browser.close()
 
