@@ -260,6 +260,63 @@ def run_copy_obs_types(job_id: str):
 
 
 # ---------------------------------------------------------------------------
+# Job Titles path — delete from destination
+# ---------------------------------------------------------------------------
+
+@app.get("/job-titles-delete/<job_id>")
+def select_job_titles_delete(job_id: str):
+    job = _jobs.get(job_id)
+    if not job:
+        return _expired()
+
+    dst_s = ht_copy.build_session(job["dst_cookie"])
+    try:
+        dst_titles = ht_copy.fetch_job_titles(dst_s, job["dst_instance"])
+    except Exception as exc:
+        return render_template("index.html", step="home", job_id=job_id,
+                               src_instance=job["src_instance"],
+                               dst_instance=job["dst_instance"],
+                               error=f"Could not load destination Job Titles: {exc}")
+
+    return render_template("index.html", step="delete_job_titles", job_id=job_id,
+                           src_instance=job["src_instance"],
+                           dst_instance=job["dst_instance"],
+                           dst_job_titles=dst_titles)
+
+
+@app.post("/delete-job-titles/<job_id>")
+def run_delete_job_titles(job_id: str):
+    job = _jobs.get(job_id)
+    if not job:
+        return _expired()
+
+    selected_ids = set(request.form.getlist("job_title_ids"))
+    if not selected_ids:
+        return redirect(url_for("select_job_titles", job_id=job_id))
+
+    dst_s = ht_copy.build_session(job["dst_cookie"])
+    try:
+        dst_titles = ht_copy.fetch_job_titles(dst_s, job["dst_instance"])
+    except Exception as exc:
+        return render_template("index.html", step="home", job_id=job_id,
+                               src_instance=job["src_instance"],
+                               dst_instance=job["dst_instance"],
+                               error=f"Could not load destination Job Titles: {exc}")
+
+    selected_items = [t for t in dst_titles if t["id"] in selected_ids]
+    results = ht_copy.delete_job_titles(dst_s, job["dst_instance"], selected_items)
+
+    return render_template("index.html", step="results",
+                           job_id=job_id,
+                           src_instance=job["src_instance"],
+                           dst_instance=job["dst_instance"],
+                           results=results,
+                           result_type="job_titles_deleted",
+                           next_step_url=url_for("select_job_titles", job_id=job_id),
+                           next_step_label="Continue to copy job titles")
+
+
+# ---------------------------------------------------------------------------
 # Job Titles path — select (fetch + diff)
 # ---------------------------------------------------------------------------
 
@@ -385,6 +442,103 @@ def run_copy_licenses(job_id: str):
                            dst_instance=job["dst_instance"],
                            results=results,
                            result_type="licenses")
+
+
+# ---------------------------------------------------------------------------
+# Inspection Types path — select (fetch + diff)
+# ---------------------------------------------------------------------------
+
+@app.get("/inspection-types/<job_id>")
+def select_inspection_types(job_id: str):
+    job = _jobs.get(job_id)
+    if not job:
+        return _expired()
+
+    if "inspection_types_unique" not in job:
+        try:
+            _, unique = ht_copy.fetch_inspection_types_with_diff(
+                job["src_instance"], job["dst_instance"],
+                job["email"], job["password"],
+            )
+            job["inspection_types_unique"] = unique
+        except Exception as exc:
+            return render_template("index.html", step="home", job_id=job_id,
+                                   src_instance=job["src_instance"],
+                                   dst_instance=job["dst_instance"],
+                                   error=f"Could not load Inspection Types: {exc}")
+
+        try:
+            _, job["dst_it_name_to_id"] = ht_copy.build_issue_type_maps_via_dev_api(
+                job["dst_instance"], job["email"], job["password"])
+        except Exception:
+            job["dst_it_name_to_id"] = {}
+
+        try:
+            dst_s = ht_copy.build_session(job["dst_cookie"])
+            job["dst_insp_cat_name_to_id"] = ht_copy.build_inspection_category_maps(
+                dst_s, job["dst_instance"])
+        except Exception:
+            job["dst_insp_cat_name_to_id"] = {}
+
+        try:
+            dst_s2 = ht_copy.build_session(job["dst_cookie"])
+            dst_checklists = ht_copy.fetch_checklists(dst_s2, job["dst_instance"])
+            job["dst_cl_name_to_id"] = {
+                ht_copy.normalize_name(cl["name"]): cl["id"] for cl in dst_checklists
+            }
+        except Exception:
+            job["dst_cl_name_to_id"] = {}
+
+    return render_template("index.html", step="select_inspection_types", job_id=job_id,
+                           src_instance=job["src_instance"],
+                           dst_instance=job["dst_instance"],
+                           inspection_types_unique=job["inspection_types_unique"])
+
+
+# ---------------------------------------------------------------------------
+# Inspection Types path — copy
+# ---------------------------------------------------------------------------
+
+@app.post("/copy-inspection-types/<job_id>")
+def run_copy_inspection_types(job_id: str):
+    job = _jobs.get(job_id)
+    if not job:
+        return _expired()
+
+    selected_ids = set(request.form.getlist("inspection_type_ids"))
+    if not selected_ids:
+        return render_template("index.html", step="select_inspection_types", job_id=job_id,
+                               src_instance=job["src_instance"],
+                               dst_instance=job["dst_instance"],
+                               inspection_types_unique=job.get("inspection_types_unique", []),
+                               error="Select at least one inspection type.")
+
+    selected_items = [
+        item for item in job.get("inspection_types_unique", [])
+        if item["id"] in selected_ids
+    ]
+
+    src_s = ht_copy.build_session(job["src_cookie"])
+    dst_s = ht_copy.build_session(job["dst_cookie"])
+    results = ht_copy.copy_inspection_types(
+        dst_session=dst_s,
+        dst_instance=job["dst_instance"],
+        selected_items=selected_items,
+        dst_it_name_to_id=job.get("dst_it_name_to_id", {}),
+        dst_cat_name_to_id=job.get("dst_insp_cat_name_to_id", {}),
+        dst_cl_name_to_id=job.get("dst_cl_name_to_id", {}),
+        src_session=src_s,
+        src_instance=job["src_instance"],
+        src_email=job["email"],
+        src_password=job["password"],
+    )
+
+    return render_template("index.html", step="results",
+                           job_id=job_id,
+                           src_instance=job["src_instance"],
+                           dst_instance=job["dst_instance"],
+                           results=results,
+                           result_type="inspection_types")
 
 
 # ---------------------------------------------------------------------------

@@ -115,11 +115,11 @@
         </a>
       </div>
       <div class="col-md-6">
-        <a href="/job-titles/{{ job_id }}" class="text-decoration-none">
+        <a href="/job-titles-delete/{{ job_id }}" class="text-decoration-none">
           <div class="card tool-card p-4 text-center h-100">
             <div class="fs-1 mb-2">👷</div>
             <h6 class="fw-bold">Job Titles</h6>
-            <p class="text-muted small mb-0">Copy unique job titles not already in destination</p>
+            <p class="text-muted small mb-0">Delete from destination, then copy from source</p>
           </div>
         </a>
       </div>
@@ -138,6 +138,15 @@
             <div class="fs-1 mb-2">📅</div>
             <h6 class="fw-bold">Meeting Types</h6>
             <p class="text-muted small mb-0">Copy unique meeting types not already in destination</p>
+          </div>
+        </a>
+      </div>
+      <div class="col-md-6">
+        <a href="/inspection-types/{{ job_id }}" class="text-decoration-none">
+          <div class="card tool-card p-4 text-center h-100">
+            <div class="fs-1 mb-2">🔎</div>
+            <h6 class="fw-bold">Inspection Types</h6>
+            <p class="text-muted small mb-0">Copy unique inspection types not already in destination</p>
           </div>
         </a>
       </div>
@@ -254,7 +263,59 @@
   </script>
 
   <!-- ============================================================
-       STEP 3c — Select job titles
+       STEP 3c-i — Delete destination job titles
+  ============================================================ -->
+  {% elif step == "delete_job_titles" %}
+  <div class="card p-4">
+    <h6 class="mb-1"><span class="step-badge">3</span>Delete job titles from destination</h6>
+    <p class="text-muted small mb-1">
+      Destination: <strong>{{ dst_instance }}</strong>
+    </p>
+    <p class="text-muted small mb-3">
+      Select titles to remove before copying from source. Leave all unchecked to skip deletion.
+    </p>
+
+    <form method="POST" action="/delete-job-titles/{{ job_id }}" id="delJtForm">
+      {% if dst_job_titles %}
+      <div class="d-flex gap-2 mb-2">
+        <button type="button" class="btn btn-sm btn-outline-secondary" onclick="toggleDelJt(true)">Select all</button>
+        <button type="button" class="btn btn-sm btn-outline-secondary" onclick="toggleDelJt(false)">Deselect all</button>
+      </div>
+      <div class="list-group mb-4" style="max-height:420px;overflow-y:auto">
+        {% for jt in dst_job_titles %}
+        <label class="list-group-item list-group-item-action d-flex gap-2 align-items-center">
+          <input type="checkbox" name="job_title_ids" value="{{ jt.id }}" class="del-jt-check">
+          <span class="fw-semibold">{{ jt.name }}</span>
+        </label>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="alert alert-info mb-3">No job titles found in destination.</div>
+      {% endif %}
+
+      <div class="d-flex align-items-center gap-3">
+        <button type="submit" class="btn btn-danger px-4" id="delJtBtn">Delete selected &amp; continue</button>
+        <div id="delJtLoading" style="display:none" class="text-muted small">
+          <span class="spinner-border spinner-border-sm me-1" role="status"></span>
+          Deleting — please wait…
+        </div>
+        <a href="/job-titles/{{ job_id }}" class="btn btn-outline-secondary">Skip &rarr; Copy</a>
+        <a href="/home/{{ job_id }}" class="btn btn-link text-muted small">Back</a>
+      </div>
+    </form>
+  </div>
+  <script>
+    function toggleDelJt(checked) {
+      document.querySelectorAll('.del-jt-check').forEach(cb => cb.checked = checked);
+    }
+    document.getElementById('delJtForm').addEventListener('submit', function() {
+      document.getElementById('delJtBtn').disabled = true;
+      document.getElementById('delJtLoading').style.display = 'inline-flex';
+    });
+  </script>
+
+  <!-- ============================================================
+       STEP 3c-ii — Select job titles
   ============================================================ -->
   {% elif step == "select_job_titles" %}
   <div class="card p-4">
@@ -362,7 +423,61 @@
   </script>
 
   <!-- ============================================================
-       STEP 3e — Select meeting types
+       STEP 3e — Select inspection types
+  ============================================================ -->
+  {% elif step == "select_inspection_types" %}
+  <div class="card p-4">
+    <h6 class="mb-1"><span class="step-badge">3</span>Select inspection types to copy</h6>
+    <p class="text-muted small mb-1">
+      From <strong>{{ src_instance }}</strong> &rarr; <strong>{{ dst_instance }}</strong>
+    </p>
+    <p class="text-muted small mb-3">
+      Showing <strong>{{ inspection_types_unique | length }}</strong> inspection type(s) unique to source.
+    </p>
+
+    {% if inspection_types_unique %}
+    <form method="POST" action="/copy-inspection-types/{{ job_id }}" id="itForm">
+      <div class="d-flex gap-2 mb-2">
+        <button type="button" class="btn btn-sm btn-outline-secondary" onclick="toggleIt(true)">Select all</button>
+        <button type="button" class="btn btn-sm btn-outline-secondary" onclick="toggleIt(false)">Deselect all</button>
+      </div>
+      <div class="list-group mb-4" style="max-height:420px;overflow-y:auto">
+        {% for it in inspection_types_unique %}
+        <label class="list-group-item list-group-item-action d-flex gap-2 align-items-center">
+          <input type="checkbox" name="inspection_type_ids" value="{{ it.id }}" class="it-check" checked>
+          <span class="fw-semibold">{{ it.name }}</span>
+        </label>
+        {% endfor %}
+      </div>
+      <div class="d-flex align-items-center gap-3">
+        <button type="submit" class="btn btn-success px-4" id="itBtn">Copy selected</button>
+        <div id="itLoading" style="display:none" class="text-muted small">
+          <span class="spinner-border spinner-border-sm me-1" role="status"></span>
+          Copying — please wait…
+        </div>
+        <a href="/home/{{ job_id }}" class="btn btn-link text-muted small">Back</a>
+      </div>
+    </form>
+    {% else %}
+    <div class="alert alert-info">
+      All inspection types from <strong>{{ src_instance }}</strong> already exist in
+      <strong>{{ dst_instance }}</strong>. Nothing to copy.
+    </div>
+    <a href="/home/{{ job_id }}" class="btn btn-outline-secondary">Back</a>
+    {% endif %}
+  </div>
+  <script>
+    function toggleIt(checked) {
+      document.querySelectorAll('.it-check').forEach(cb => cb.checked = checked);
+    }
+    document.getElementById('itForm') && document.getElementById('itForm').addEventListener('submit', function() {
+      document.getElementById('itBtn').disabled = true;
+      document.getElementById('itLoading').style.display = 'inline-flex';
+    });
+  </script>
+
+  <!-- ============================================================
+       STEP 3f — Select meeting types
   ============================================================ -->
   {% elif step == "select_meeting_types" %}
   <div class="card p-4">
@@ -465,6 +580,9 @@
     </div>
 
     <div class="mt-4 d-flex gap-2">
+      {% if next_step_url %}
+      <a href="{{ next_step_url }}" class="btn btn-success">{{ next_step_label }}</a>
+      {% endif %}
       {% if job_id %}
       <a href="/home/{{ job_id }}" class="btn btn-primary">Copy more</a>
       {% endif %}

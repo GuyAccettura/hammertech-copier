@@ -178,23 +178,33 @@ def build_issue_type_maps_via_dev_api(
     instance: str, email: str, password: str
 ) -> Tuple[Dict[str, str], Dict[str, str]]:
     """
-    Fetch IssueTypes from the developer API (bearer token auth).
-    Returns (id_to_name, norm_name_to_id).
+    Fetch all IssueTypes from the developer API (bearer token auth), paginating
+    with skip/take=100 until exhausted. Returns (id_to_name, norm_name_to_id).
     """
     token = get_bearer_token(instance, email, password)
-    r = requests.get(
-        f"{DEV_API_BASE}/api/v1/IssueTypes",
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-        timeout=30,
-    )
-    r.raise_for_status()
-    items = r.json()
-    if not isinstance(items, list):
-        raise ValueError(f"Unexpected IssueTypes response: {type(items)}")
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    all_items: List[Dict[str, Any]] = []
+    page_size = 100
+    skip = 0
+    while True:
+        r = requests.get(
+            f"{DEV_API_BASE}/api/v1/IssueTypes",
+            headers=headers,
+            params={"take": page_size, "skip": skip},
+            timeout=30,
+        )
+        r.raise_for_status()
+        page = r.json()
+        if not isinstance(page, list):
+            raise ValueError(f"Unexpected IssueTypes response: {type(page)}")
+        all_items.extend(page)
+        if len(page) < page_size:
+            break
+        skip += page_size
 
     id_to_name: Dict[str, str] = {}
     norm_name_to_id: Dict[str, str] = {}
-    for item in items:
+    for item in all_items:
         obs_id = str(item.get("id") or "").strip()
         name = str(item.get("name") or "").strip()
         if obs_id and name:
@@ -346,15 +356,16 @@ def fetch_obs_types_with_diff(
     src_items = fetch_observation_types_via_session(src_session, src_base)
     dst_items = fetch_observation_types_via_session(dst_session, dst_base)
 
-    dst_names = {
-        normalize_name(item.get("name") or item.get("Name") or "")
-        for item in dst_items
-    }
+    def _obs_name(item: Dict[str, Any]) -> str:
+        return normalize_name(
+            item.get("name") or item.get("Name")
+            or item.get("displayName") or item.get("DisplayName")
+            or item.get("observationTypeName") or ""
+        )
 
-    unique = [
-        item for item in src_items
-        if normalize_name(item.get("name") or item.get("Name") or "") not in dst_names
-    ]
+    dst_names = {_obs_name(item) for item in dst_items}
+
+    unique = [item for item in src_items if _obs_name(item) not in dst_names]
     return src_items, unique
 
 
@@ -642,6 +653,32 @@ def fetch_job_titles(session: requests.Session, instance: str) -> List[Dict[str,
         m = re.search(r"/Details/([^/]+)$", href)
         if m and name:
             results.append({"id": m.group(1), "name": name})
+    return results
+
+
+JOB_TITLES_DELETE_PATH = "company/Internal/JobTitles/Delete"
+
+
+def delete_job_titles(
+    dst_session: requests.Session,
+    dst_instance: str,
+    selected_items: List[Dict[str, str]],
+) -> List[Dict[str, Any]]:
+    """DELETE each selected job title from the destination via GET request."""
+    results = []
+    for item in selected_items:
+        name = item["name"]
+        entry: Dict[str, Any] = {"name": name}
+        try:
+            delete_url = f"https://{dst_instance}.hammertechonline.com/{JOB_TITLES_DELETE_PATH}/{item['id']}"
+            resp = dst_session.get(delete_url, timeout=30, allow_redirects=False)
+            if resp.status_code in (200, 201, 302):
+                entry.update(status="success", message=f"HTTP {resp.status_code}")
+            else:
+                entry.update(status="error", message=f"HTTP {resp.status_code}: {(resp.text or '')[:400]}")
+        except Exception as exc:
+            entry.update(status="error", message=str(exc))
+        results.append(entry)
     return results
 
 
@@ -968,9 +1005,9 @@ def fetch_meeting_types_with_diff(
     return src_items, unique
 
 
-def _scrape_dst_project_fields(session: requests.Session, instance: str) -> List[tuple]:
+def _scrape_dst_project_fields(session: requests.Session, instance: str, path: str = MEETING_TYPES_CREATE_PATH) -> List[tuple]:
     """Scrape all applicableProjectIds and applicableProjectRegions from the Create page."""
-    url = f"https://{instance}.hammertechonline.com/{MEETING_TYPES_CREATE_PATH}"
+    url = f"https://{instance}.hammertechonline.com/{path}"
     r = session.get(url, timeout=30)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
@@ -1063,6 +1100,294 @@ def copy_meeting_types(
                 msg = f"HTTP {resp.status_code}"
                 if skipped:
                     msg += f" — SubForm fields skipped (manual setup required): {', '.join(skipped)}"
+                entry.update(status="success", message=msg)
+            else:
+                entry.update(
+                    status="error",
+                    message=f"HTTP {resp.status_code}: {(resp.text or '')[:400]}",
+                )
+        except Exception as exc:
+            entry.update(status="error", message=str(exc))
+        results.append(entry)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Inspection Types path  (API-based)
+# ---------------------------------------------------------------------------
+
+INSPECTION_TYPES_LIST_PATH = "company/Internal/InspectionTypes"
+INSPECTION_TYPES_CREATE_PATH = "company/Internal/InspectionTypes/Create"
+INSPECTION_TYPES_EDIT_PATH = "company/Internal/InspectionTypes/Edit"
+
+_IT_BOOL_FIELDS = [
+    "IsHiddenFromCreate",
+    "IsEmployerAllowedToCreate",
+    "IsEmployerAllowedToAddChecklist",
+    "IsWorkerAllowedToCreate",
+    "IsAssociatedToPersonnel",
+    "IsAssociatedToSwms",
+]
+
+
+def fetch_inspection_types_via_api(
+    instance: str, email: str, password: str, full_detail: bool = False
+) -> List[Dict[str, Any]]:
+    """Fetch all inspection types from the developer API.
+    If full_detail=True, fetches each item individually for complete field data."""
+    token = get_bearer_token(instance, email, password)
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    r = requests.get(
+        f"{DEV_API_BASE}/api/v1/InspectionTypes",
+        headers=headers,
+        timeout=30,
+    )
+    r.raise_for_status()
+    items = r.json()
+    if not isinstance(items, list):
+        raise ValueError(f"Unexpected InspectionTypes response: {type(items)}")
+    if not full_detail:
+        return items
+    # Fetch full detail for each item individually
+    detailed = []
+    for item in items:
+        item_id = item.get("id")
+        if not item_id:
+            continue
+        rd = requests.get(
+            f"{DEV_API_BASE}/api/v1/InspectionTypes/{item_id}",
+            headers=headers,
+            timeout=30,
+        )
+        if rd.status_code == 200:
+            detailed.append(rd.json())
+        else:
+            detailed.append(item)  # fall back to summary
+    return detailed
+
+
+def fetch_inspection_types_with_diff(
+    src_instance: str,
+    dst_instance: str,
+    email: str,
+    password: str,
+) -> tuple:
+    """Returns (src_items, unique_to_src). Unique items have full detail."""
+    # List endpoint only for dst (just need names)
+    src_summary = fetch_inspection_types_via_api(src_instance, email, password, full_detail=False)
+    dst_summary = fetch_inspection_types_via_api(dst_instance, email, password, full_detail=False)
+    dst_names = {normalize_name(i.get("name", "")) for i in dst_summary}
+    unique_summary = [i for i in src_summary if normalize_name(i.get("name", "")) not in dst_names]
+
+    # Fetch full detail only for the unique items
+    token = get_bearer_token(src_instance, email, password)
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    unique_detailed = []
+    for item in unique_summary:
+        item_id = item.get("id")
+        if not item_id:
+            continue
+        rd = requests.get(
+            f"{DEV_API_BASE}/api/v1/InspectionTypes/{item_id}",
+            headers=headers,
+            timeout=30,
+        )
+        unique_detailed.append(rd.json() if rd.status_code == 200 else item)
+
+    unique_detailed.sort(key=lambda i: (i.get("name") or "").lower())
+    return src_summary, unique_detailed
+
+
+def _scrape_select_options(session: requests.Session, url: str, select_name: str) -> Dict[str, str]:
+    """Scrape a page and return {option_text_normalized: option_value} for a named <select>."""
+    r = session.get(url, timeout=30)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    sel = soup.find("select", {"name": select_name})
+    if not sel:
+        return {}
+    return {
+        normalize_name(opt.get_text(strip=True)): opt.get("value", "")
+        for opt in sel.find_all("option")
+        if opt.get("value")
+    }
+
+
+def build_inspection_category_maps(
+    dst_session: requests.Session,
+    dst_instance: str,
+) -> Dict[str, str]:
+    """Returns dst_name_to_id for InspectionCategory by scraping the Create page."""
+    dst_url = f"https://{dst_instance}.hammertechonline.com/{INSPECTION_TYPES_CREATE_PATH}"
+    return _scrape_select_options(dst_session, dst_url, "InspectionCategoryId")
+
+
+def copy_inspection_types(
+    dst_session: requests.Session,
+    dst_instance: str,
+    selected_items: List[Dict[str, Any]],
+    dst_it_name_to_id: Dict[str, str],
+    dst_cat_name_to_id: Dict[str, str],
+    dst_cl_name_to_id: Dict[str, str],
+    src_session: requests.Session = None,
+    src_instance: str = None,
+    src_email: str = None,
+    src_password: str = None,
+) -> List[Dict[str, Any]]:
+    """Copy inspection types from API data to destination via MVC form POST."""
+    create_url = f"https://{dst_instance}.hammertechonline.com/{INSPECTION_TYPES_CREATE_PATH}"
+    form_headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+    # Scrape DefaultInspectionReportType options (text→value) from dst create page
+    report_type_opts = _scrape_select_options(dst_session, create_url, "DefaultInspectionReportType")
+
+    # Scrape dst project fields once
+    try:
+        dst_project_fields = _scrape_dst_project_fields(
+            dst_session, dst_instance, INSPECTION_TYPES_CREATE_PATH)
+    except Exception:
+        dst_project_fields = []
+
+    # API defaultInspectionReportType string → normalize to match scraped option text
+    # e.g. "OpenNoPictures" → "open no pictures" matches "Open (No Pictures)"
+    # Strip non-alphanumeric chars so parentheses in option text don't break the match.
+    def _alnum_only(s: str) -> str:
+        return re.sub(r'[^a-z0-9]', '', s.lower())
+
+    def _api_report_type_to_form_val(api_val: str) -> str:
+        if not api_val:
+            return ""
+        words = re.sub(r"([A-Z])", r" \1", api_val).strip()
+        target = _alnum_only(words)
+        for opt_text, opt_val in report_type_opts.items():
+            if _alnum_only(opt_text) == target:
+                return opt_val
+        return ""
+
+    _FLAG_KEYS = [
+        "isHiddenFromCreate", "isEmployerAllowedToCreate", "isEmployerAllowedToAddChecklist",
+        "isWorkerAllowedToCreate", "isAssociatedToPersonnel", "isAssociatedToSwms",
+    ]
+
+    # Fetch a bearer token once so we can re-pull full detail per item from the dev API
+    src_bearer_token = None
+    if src_instance and src_email and src_password:
+        try:
+            src_bearer_token = get_bearer_token(src_instance, src_email, src_password)
+        except Exception as exc:
+            print(f"[WARN] Could not get bearer token for src '{src_instance}': {exc}")
+
+    results = []
+    for item in selected_items:
+        name = item.get("name", "")
+        entry: Dict[str, Any] = {"name": name}
+        warnings = []
+        try:
+            # Re-fetch full inspection type detail from the source developer API so that
+            # all current settings (flags, checklists, issue types, etc.) are applied.
+            item_id = item.get("id", "")
+            if src_bearer_token and item_id:
+                rd = requests.get(
+                    f"{DEV_API_BASE}/api/v1/InspectionTypes/{item_id}",
+                    headers={
+                        "Authorization": f"Bearer {src_bearer_token}",
+                        "Accept": "application/json",
+                    },
+                    timeout=30,
+                )
+                if rd.status_code == 200:
+                    item = rd.json()
+                    print(f"[DEBUG] Re-fetched detail for '{name}' from dev API")
+                else:
+                    print(f"[WARN] Dev API returned {rd.status_code} for '{name}', using cached detail")
+
+            csrf = _get_csrf_token_for_path(dst_session, dst_instance, INSPECTION_TYPES_CREATE_PATH)
+            flags = item.get("inspectionTypeFlags") or {}
+            # Fallback: some API versions put flags directly on the item
+            if not flags and any(item.get(k) for k in _FLAG_KEYS):
+                flags = item
+
+            # Map category by name
+            cat_name = (item.get("category") or {}).get("name", "")
+            cat_id = dst_cat_name_to_id.get(normalize_name(cat_name), "")
+            if cat_name and not cat_id:
+                warnings.append(f"category '{cat_name}' not found in dst")
+
+            # Map default issue type by name
+            default_it_name = (item.get("defaultIssueType") or {}).get("name", "")
+            default_it_id = dst_it_name_to_id.get(normalize_name(default_it_name), "")
+            if default_it_name and not default_it_id:
+                warnings.append(f"default issue type '{default_it_name}' not found in dst")
+
+            report_type_raw = (
+                flags.get("defaultInspectionReportType")
+                or item.get("defaultInspectionReportType")
+                or ""
+            )
+            report_type_val = _api_report_type_to_form_val(report_type_raw)
+
+            data: list = [
+                ("__RequestVerificationToken", csrf),
+                ("Name", name),
+                ("InspectionCategoryId", cat_id),
+                ("DefaultInspectionIssueTypeId", default_it_id),
+                ("DefaultInspectionReportType", report_type_val),
+            ]
+
+            flag_map = {
+                "IsHiddenFromCreate":             bool(flags.get("isHiddenFromCreate", False)),
+                "IsEmployerAllowedToCreate":       bool(flags.get("isEmployerAllowedToCreate", False)),
+                "IsEmployerAllowedToAddChecklist": bool(flags.get("isEmployerAllowedToAddChecklist", False)),
+                "IsWorkerAllowedToCreate":         bool(flags.get("isWorkerAllowedToCreate", False)),
+                "IsAssociatedToPersonnel":         bool(flags.get("isAssociatedToPersonnel", False)),
+                "IsAssociatedToSwms":              bool(flags.get("isAssociatedToSwms", False)),
+            }
+            for field, val in flag_map.items():
+                if val:
+                    data.append((field, "true"))
+                data.append((field, "false"))
+
+            # Map allowedIssueTypes (issueTypesThatCanBeRaised) by name
+            for it in item.get("issueTypesThatCanBeRaised", []):
+                it_name = it.get("name", "")
+                dst_id = dst_it_name_to_id.get(normalize_name(it_name), "")
+                if dst_id:
+                    data.append(("allowedIssueTypes", dst_id))
+                elif it_name:
+                    warnings.append(f"observation type '{it_name}' not found in dst")
+
+            # Map checklist options by name
+            checklist_options = item.get("checklistTypeOptions", [])
+            dst_cl_entries = []
+            for opt in checklist_options:
+                cl_name = (opt.get("checklistType") or {}).get("name", "")
+                dst_cl_id = dst_cl_name_to_id.get(normalize_name(cl_name), "")
+                if dst_cl_id:
+                    dst_cl_entries.append({
+                        "ChecklistTypeId": dst_cl_id,
+                        "IsAddedAutomatically": opt.get("isAddedAutomatically", False),
+                    })
+                elif cl_name:
+                    warnings.append(f"checklist '{cl_name}' not found in dst")
+
+            # Send Index slots + actual checklist data (0-based, indices must match)
+            for i in range(len(dst_cl_entries)):
+                data.append(("checklistOptions.Index", str(i)))
+            for i, cl_entry in enumerate(dst_cl_entries):
+                idx = str(i)
+                data.append((f"checklistOptions[{idx}].ChecklistTypeId", cl_entry["ChecklistTypeId"]))
+                if cl_entry["IsAddedAutomatically"]:
+                    data.append((f"checklistOptions[{idx}].IsAddedAutomatically", "true"))
+
+            data.extend(dst_project_fields)
+            data.append(("addToFutureProjectsByRegion", "All"))
+
+            resp = dst_session.post(create_url, data=data, headers=form_headers,
+                                    timeout=30, allow_redirects=False)
+            if resp.status_code in (200, 201, 302):
+                msg = f"HTTP {resp.status_code}"
+                if warnings:
+                    msg += " — warnings: " + "; ".join(warnings)
                 entry.update(status="success", message=msg)
             else:
                 entry.update(
